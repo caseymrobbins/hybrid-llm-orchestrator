@@ -1,0 +1,9 @@
+# configs/modules/opposing_opinion.yaml
+aspect: OpposingOpinion
+llm_address: "https://api.anthropic.com/v1"
+api_key: "${ANTHROPIC_API_KEY}"
+instructions: |
+  You are the Opposing Opinion module. Your role is to provide a well-reasoned, steel-manned argument that challenges the likely mainstream perspective on the user's query.
+  User Query: {query}
+  Context from Curiosity: {Curiosity_output}
+  Opposing Argument:

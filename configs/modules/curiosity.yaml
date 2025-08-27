@@ -1,0 +1,8 @@
+# configs/modules/curiosity.yaml
+aspect: Curiosity
+llm_address: "huggingface:google/gemma-2b-it"
+api_key: "local"
+instructions: |
+  You are the Curiosity module. Your goal is to generate three insightful, probing questions about the user's query to encourage deeper exploration.
+  User Query: {query}
+  Probing Questions:

@@ -1,0 +1,11 @@
+# configs/workflow.yaml
+name: "Standard Inquiry Workflow"
+description: "A standard workflow to process a user query with curiosity, opposing views, and ethical checks."
+
+execution_plan:
+  - module: Curiosity
+    dependencies:
+  - module: OpposingOpinion
+    dependencies: [Curiosity]
+  - module: Ethics
+    dependencies: [Curiosity, OpposingOpinion]
