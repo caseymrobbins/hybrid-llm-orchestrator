@@ -1,9 +1,10 @@
+# requirements.txt
+
 # Core dependencies
 pydantic==2.7.1
 pyyaml==6.0.1
 python-dotenv==1.0.1
 aiohttp==3.9.5
-asyncio==3.4.3
 
 # LLM Libraries
 transformers==4.41.2
@@ -11,15 +12,15 @@ torch==2.3.0
 openai==1.30.0
 anthropic==0.25.0
 
-# RouteLLM for intelligent routing
-routellm
+# RouteLLM for intelligent routing (optional)
+# routellm
 
 # Security
 scrubadub==2.0.1
-pytector==0.2.0
-
-# Caching (optional but recommended)
-upstash-semantic-cache==0.2.1
+# pytector==0.2.0  # May not be available, implement custom solution
+pytector
+# Caching
+diskcache==5.6.3
 
 # For the web interface
 fastapi==0.111.0
@@ -29,11 +30,21 @@ websockets==12.0
 # Resilience
 pybreaker==1.1.0
 
+# Database
+sqlite3  # Built into Python
+
+# Utilities
+numpy==1.24.3
+scipy==1.11.1
+
+# Development and testing (optional)
+pytest==7.4.0
+pytest-asyncio==0.21.1
+
+# Optional: Advanced model optimizations
+# bitsandbytes==0.41.1  # For model quantization
+# accelerate==0.21.0    # For model loading optimizations
+
 # CLI enhancements (optional)
 click==8.1.7
 rich==13.7.0
-Install everything:
-bashpip install -r requirements.txt
-Step 4: Create Your .env File
-bash# Create .env in the root directory
-touch .env

@@ -7,23 +7,90 @@ import logging
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
+import time
 
 from .config import ConfigLoader, ModuleConfig
 from .utils.security import SecurityManager
 from .clients.base import LlmClient
 from .clients.openai_compatible import OpenAICompatibleClient
-from .utils.local_inference import BatchedLocalInference, OptimizedLocalModelLoader
+from .clients.anthropic import AnthropicClient
+from .clients.local import LocalClient
+from .utils.caching import Cache, SemanticCache
 
-# External dependencies
-from routellm.controller import Controller
-from upstash_semantic_cache import SemanticCache
-from pybreaker import CircuitBreaker, CircuitBreakerError
+# External dependencies (with fallback if not available)
+try:
+    from routellm.controller import Controller
+    HAS_ROUTELLM = True
+except ImportError:
+    HAS_ROUTELLM = False
+    Controller = None
+
+try:
+    from pybreaker import CircuitBreaker, CircuitBreakerError
+    HAS_CIRCUIT_BREAKER = True
+except ImportError:
+    HAS_CIRCUIT_BREAKER = False
+    CircuitBreaker = None
+    CircuitBreakerError = Exception
 
 logger = logging.getLogger(__name__)
 
 class OrchestrationError(Exception):
     """Custom exception for orchestration errors."""
     pass
+
+class SimpleRouter:
+    """Simple router fallback when RouteLLM is not available."""
+    def __init__(self, strong_model: str, weak_model: str):
+        self.strong_model = strong_model
+        self.weak_model = weak_model
+    
+    def route(self, query: str) -> str:
+        """Simple routing based on query length."""
+        if len(query) > 100:
+            return self.strong_model
+        return self.weak_model
+
+class SimpleCircuitBreaker:
+    """Simple circuit breaker fallback."""
+    def __init__(self, fail_max=3, reset_timeout=60):
+        self.fail_max = fail_max
+        self.reset_timeout = reset_timeout
+        self.failure_count = 0
+        self.last_failure_time = 0
+        self.state = "closed"  # closed, open, half-open
+    
+    def __call__(self, func):
+        def wrapper(*args, **kwargs):
+            current_time = time.time()
+            
+            # Check if we should reset
+            if (self.state == "open" and 
+                current_time - self.last_failure_time > self.reset_timeout):
+                self.state = "half-open"
+                self.failure_count = 0
+            
+            # If circuit is open, fail fast
+            if self.state == "open":
+                raise Exception("Circuit breaker is open")
+            
+            try:
+                result = func(*args, **kwargs)
+                # Success - close circuit if it was half-open
+                if self.state == "half-open":
+                    self.state = "closed"
+                    self.failure_count = 0
+                return result
+            except Exception as e:
+                self.failure_count += 1
+                self.last_failure_time = current_time
+                
+                if self.failure_count >= self.fail_max:
+                    self.state = "open"
+                
+                raise e
+        
+        return wrapper
 
 class Orchestrator:
     """Manages the execution of the AI workflow with production-grade features."""
@@ -35,12 +102,11 @@ class Orchestrator:
         
         # Client registry for different LLM providers
         self.clients: Dict[str, LlmClient] = {}
-        self.local_inference: Optional[BatchedLocalInference] = None
         
         # Production features
-        self.router: Optional[Controller] = None
-        self.semantic_cache: Optional[SemanticCache] = None
-        self.circuit_breakers: Dict[str, CircuitBreaker] = {}
+        self.router: Optional[Any] = None
+        self.semantic_cache: Optional[Cache] = None
+        self.circuit_breakers: Dict[str, Any] = {}
         
         # State management
         self._initialized = False
@@ -72,18 +138,23 @@ class Orchestrator:
             raise OrchestrationError(f"Initialization failed: {e}")
 
     async def _initialize_router(self) -> None:
-        """Initialize the RouteLLM controller."""
+        """Initialize the RouteLLM controller or fallback."""
         try:
-            # RouteLLM initialization - this may be sync, so we run in executor
-            self.router = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: Controller(
-                    routers=["mf"],  # Matrix Factorization router
-                    strong_model="gpt-4o",
-                    weak_model="huggingface:google/gemma-2b-it"
+            if HAS_ROUTELLM and Controller:
+                # RouteLLM initialization - this may be sync, so we run in executor
+                self.router = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: Controller(
+                        routers=["mf"],  # Matrix Factorization router
+                        strong_model="gpt-4o",
+                        weak_model="huggingface:google/gemma-2b-it"
+                    )
                 )
-            )
-            logger.info("RouteLLM controller initialized")
+                logger.info("RouteLLM controller initialized")
+            else:
+                # Fallback simple router
+                self.router = SimpleRouter("gpt-4o", "huggingface:google/gemma-2b-it")
+                logger.info("Simple router fallback initialized")
         except Exception as e:
             logger.warning(f"Failed to initialize router: {e}. Routing will be disabled.")
             self.router = None
@@ -91,7 +162,10 @@ class Orchestrator:
     async def _initialize_cache(self) -> None:
         """Initialize semantic cache."""
         try:
-            self.semantic_cache = SemanticCache(min_proximity=0.90)
+            self.semantic_cache = SemanticCache(
+                cache_dir=".cache/semantic",
+                similarity_threshold=0.90
+            )
             logger.info("Semantic cache initialized")
         except Exception as e:
             logger.warning(f"Failed to initialize cache: {e}. Caching will be disabled.")
@@ -103,12 +177,15 @@ class Orchestrator:
         external_endpoints = self._get_external_endpoints()
         
         for endpoint in external_endpoints:
-            self.circuit_breakers[endpoint] = CircuitBreaker(
-                fail_max=3,
-                reset_timeout=60,
-                recovery_timeout=30,
-                expected_exception=Exception
-            )
+            if HAS_CIRCUIT_BREAKER and CircuitBreaker:
+                self.circuit_breakers[endpoint] = CircuitBreaker(
+                    fail_max=3,
+                    reset_timeout=60,
+                    recovery_timeout=30,
+                    expected_exception=Exception
+                )
+            else:
+                self.circuit_breakers[endpoint] = SimpleCircuitBreaker()
         
         logger.info(f"Initialized circuit breakers for {len(self.circuit_breakers)} endpoints")
 
@@ -122,7 +199,8 @@ class Orchestrator:
                 address = module_config.llm_address
                 if ":" in address and not address.startswith("huggingface"):
                     provider = address.split(":")[0]
-                    endpoints.add(provider)
+                    if provider not in ["local", "huggingface"]:
+                        endpoints.add(provider)
                     
         return list(endpoints)
 
@@ -138,25 +216,31 @@ class Orchestrator:
         """Create appropriate client based on configuration."""
         try:
             address = config.llm_address
+            api_key = getattr(config, 'api_key', 'local')
             
-            if address.startswith("openai:"):
+            if address.startswith("https://api.openai.com"):
                 return OpenAICompatibleClient(
-                    api_key=config.get("api_key", ""),
+                    api_key=api_key,
                     base_url="https://api.openai.com/v1"
                 )
-            elif address.startswith("anthropic:"):
+            elif address.startswith("https://api.anthropic.com"):
+                return AnthropicClient(api_key=api_key)
+            elif address.startswith("https://api.x.ai"):
                 return OpenAICompatibleClient(
-                    api_key=config.get("api_key", ""),
-                    base_url="https://api.anthropic.com/v1"
+                    api_key=api_key,
+                    base_url="https://api.x.ai/v1"
                 )
-            elif address.startswith("huggingface:"):
-                # For local models, initialize if not already done
-                if not self.local_inference:
-                    model_name = address.split(":", 1)[1]
-                    model, tokenizer = OptimizedLocalModelLoader.load_model_and_tokenizer(model_name)
-                    self.local_inference = BatchedLocalInference(model, tokenizer)
-                    await self.local_inference.start()
-                return self.local_inference
+            elif "openai:" in address:
+                return OpenAICompatibleClient(
+                    api_key=api_key,
+                    base_url="https://api.openai.com/v1"
+                )
+            elif "anthropic:" in address:
+                return AnthropicClient(api_key=api_key)
+            elif address.startswith("huggingface:") or "huggingface" in address:
+                # For local models
+                model_name = address.split(":", 1)[1] if ":" in address else "google/gemma-2b-it"
+                return LocalClient(model_name)
             else:
                 logger.warning(f"Unknown provider in address: {address}")
                 return None
@@ -175,7 +259,14 @@ class Orchestrator:
         try:
             prompt = config.instructions.format(**context)
         except KeyError as e:
-            raise OrchestrationError(f"Missing context variable for module '{module_name}': {e}")
+            missing_key = str(e).strip("'\"")
+            logger.warning(f"Missing context variable '{missing_key}' for module '{module_name}', using empty string")
+            # Create a copy of context with missing keys as empty strings
+            safe_context = context.copy()
+            safe_context[missing_key] = ""
+            prompt = config.instructions.format(**safe_context)
+        except Exception as e:
+            raise OrchestrationError(f"Failed to format prompt for module '{module_name}': {e}")
 
         # 1. Security: Prompt Injection Check
         try:
@@ -187,12 +278,13 @@ class Orchestrator:
             logger.warning(f"Security check failed for module '{module_name}': {e}")
 
         # 2. Caching: Check Semantic Cache
+        cache_key = f"{module_name}:{prompt[:100]}"  # Truncate for cache key
         if self.semantic_cache:
             try:
-                cached_result = self.semantic_cache.get(prompt)
+                cached_result = await self.semantic_cache.get(cache_key, prefix=module_name)
                 if cached_result:
                     logger.info(f"Cache hit for module '{module_name}'")
-                    return cached_result
+                    return f"[CACHED] {cached_result}"
             except Exception as e:
                 logger.warning(f"Cache lookup failed: {e}")
 
@@ -209,9 +301,9 @@ class Orchestrator:
         result = await self._execute_with_resilience(module_name, scrubbed_prompt, config)
 
         # 5. Store in cache
-        if self.semantic_cache and result:
+        if self.semantic_cache and result and not result.startswith("Error:"):
             try:
-                self.semantic_cache.set(prompt, result)
+                await self.semantic_cache.set(cache_key, result, prefix=module_name)
             except Exception as e:
                 logger.warning(f"Cache storage failed: {e}")
 
@@ -229,25 +321,26 @@ class Orchestrator:
         circuit_breaker = self.circuit_breakers.get(provider) if provider else None
 
         try:
-            if circuit_breaker:
-                # Wrap execution in circuit breaker
+            if circuit_breaker and provider not in ["local", "huggingface"]:
+                # Wrap execution in circuit breaker for external services
                 result = await self._execute_with_circuit_breaker(
                     circuit_breaker, client, prompt, **config.get_generation_params()
                 )
             else:
-                # Direct execution for local models
+                # Direct execution for local models or when no circuit breaker
                 result = await client.generate(prompt, **config.get_generation_params())
 
             return result
 
-        except CircuitBreakerError:
-            logger.warning(f"Circuit breaker open for module '{module_name}', using fallback")
-            return await self._fallback_execution(prompt)
-        except Exception as e:
-            logger.error(f"Module '{module_name}' execution failed: {e}")
-            return f"Error: Module {module_name} failed to produce a result."
+        except (CircuitBreakerError, Exception) as e:
+            if "circuit breaker" in str(e).lower():
+                logger.warning(f"Circuit breaker open for module '{module_name}', using fallback")
+                return await self._fallback_execution(prompt, config)
+            else:
+                logger.error(f"Module '{module_name}' execution failed: {e}")
+                return await self._fallback_execution(prompt, config)
 
-    async def _execute_with_circuit_breaker(self, breaker: CircuitBreaker, client: LlmClient, prompt: str, **kwargs) -> str:
+    async def _execute_with_circuit_breaker(self, breaker: Any, client: LlmClient, prompt: str, **kwargs) -> str:
         """Execute client call wrapped in circuit breaker."""
         def sync_call():
             # This is a workaround for circuit breakers that expect sync functions
@@ -261,13 +354,17 @@ class Orchestrator:
         # Run the circuit-breaker-protected call in executor
         return await asyncio.get_event_loop().run_in_executor(None, breaker(sync_call))
 
-    async def _fallback_execution(self, prompt: str) -> str:
+    async def _fallback_execution(self, prompt: str, config: ModuleConfig) -> str:
         """Fallback execution when primary service is unavailable."""
-        if self.local_inference:
-            try:
-                return await self.local_inference.generate(prompt)
-            except Exception as e:
-                logger.error(f"Fallback execution failed: {e}")
+        # Try to find a local client as fallback
+        for client in self.clients.values():
+            if isinstance(client, LocalClient):
+                try:
+                    logger.info("Using local client as fallback")
+                    return await client.generate(prompt, max_tokens=config.get("max_tokens", 512))
+                except Exception as e:
+                    logger.error(f"Fallback execution failed: {e}")
+                    continue
         
         return "Error: Service temporarily unavailable. Please try again later."
 
@@ -275,28 +372,38 @@ class Orchestrator:
         """Extract provider name from module configuration."""
         if hasattr(config, 'llm_address'):
             address = config.llm_address
-            if ":" in address and not address.startswith("huggingface"):
-                return address.split(":")[0]
+            if ":" in address:
+                provider = address.split(":")[0]
+                if "http" in provider:
+                    # Extract from URL
+                    if "api.openai.com" in address:
+                        return "openai"
+                    elif "api.anthropic.com" in address:
+                        return "anthropic"
+                    elif "api.x.ai" in address:
+                        return "xai"
+                return provider
         return None
 
-    async def execute_workflow(self, query: str) -> str:
+    async def execute_workflow(self, query: str, user_id: int = 1) -> str:
         """Execute the full workflow defined in configuration."""
         if not self._initialized:
             await self.initialize()
 
         execution_plan = self.config_loader.workflow_config.execution_plan
-        context = {"query": query}
+        context = {"query": query, "user_id": user_id}
 
         try:
             # Execute modules according to plan
             for step in execution_plan:
-                module_name = step["module"]
-                dependencies = step.get("dependencies", [])
+                module_name = step.module
+                dependencies = step.dependencies
 
                 # Check dependencies
                 missing_deps = [dep for dep in dependencies if dep not in context]
                 if missing_deps:
-                    raise OrchestrationError(f"Missing dependencies for module {module_name}: {missing_deps}")
+                    logger.warning(f"Missing dependencies for module {module_name}: {missing_deps}")
+                    # Continue with available context
 
                 logger.info(f"Running module: {module_name}")
                 result = await self._execute_module(module_name, context)
@@ -320,38 +427,74 @@ class Orchestrator:
         synthesis_prompt = self._build_synthesis_prompt(query, context)
         
         # Use local model for synthesis to reduce costs and latency
-        if self.local_inference:
+        local_client = None
+        for client in self.clients.values():
+            if isinstance(client, LocalClient):
+                local_client = client
+                break
+        
+        if local_client:
             try:
-                return await self.local_inference.generate(synthesis_prompt)
+                return await local_client.generate(synthesis_prompt, max_tokens=512)
             except Exception as e:
                 logger.warning(f"Local synthesis failed: {e}")
 
         # Fallback to any available client
         for client in self.clients.values():
             try:
-                return await client.generate(synthesis_prompt, max_tokens=512)
+                return await client.generate(synthesis_prompt, max_tokens=512, temperature=0.3)
             except Exception as e:
                 logger.warning(f"Synthesis fallback failed: {e}")
                 continue
 
-        return "Error: Unable to synthesize final response."
+        # Ultimate fallback - simple concatenation
+        return self._simple_synthesis(query, context)
+
+    def _simple_synthesis(self, query: str, context: Dict[str, Any]) -> str:
+        """Simple synthesis fallback when all else fails."""
+        outputs = []
+        for key, value in context.items():
+            if key.endswith("_output") and isinstance(value, str) and value.strip():
+                module_name = key.replace("_output", "")
+                clean_value = value.replace("[CACHED]", "").strip()
+                if clean_value and not clean_value.startswith("Error:"):
+                    outputs.append(f"**{module_name}**: {clean_value}")
+        
+        if not outputs:
+            return f"I apologize, but I was unable to process your query: {query}"
+        
+        return f"Based on your query: '{query}'\n\n" + "\n\n".join(outputs)
 
     def _build_synthesis_prompt(self, query: str, context: Dict[str, Any]) -> str:
         """Build the synthesis prompt from context."""
         prompt_parts = [
-            f"Synthesize the following information into a coherent response for: \"{query}\"",
+            f"Please provide a comprehensive, well-structured response to the following query: \"{query}\"",
+            "",
+            "Use the following analysis to inform your response:",
             ""
         ]
 
         # Add module outputs
         for key, value in context.items():
-            if key.endswith("_output") and value:
+            if key.endswith("_output") and isinstance(value, str) and value.strip():
                 module_name = key.replace("_output", "")
-                prompt_parts.append(f"{module_name} Output:")
-                prompt_parts.append(str(value))
-                prompt_parts.append("")
+                clean_value = value.replace("[CACHED]", "").strip()
+                if clean_value and not clean_value.startswith("Error:"):
+                    prompt_parts.append(f"## {module_name}:")
+                    prompt_parts.append(clean_value)
+                    prompt_parts.append("")
 
-        prompt_parts.append("Final Response:")
+        prompt_parts.extend([
+            "## Instructions:",
+            "- Synthesize the above information into a coherent, helpful response",
+            "- Address the user's query directly and comprehensively", 
+            "- Include relevant details from each analysis where appropriate",
+            "- Use a natural, conversational tone",
+            "- Ensure the response is well-structured and easy to follow",
+            "",
+            "## Response:"
+        ])
+        
         return "\n".join(prompt_parts)
 
     async def health_check(self) -> Dict[str, Any]:
@@ -366,14 +509,21 @@ class Orchestrator:
         api_status = await self._check_api_connectivity()
         
         # Check circuit breakers
-        breaker_status = {
-            name: {
-                "state": str(cb.current_state),
-                "failure_count": cb.fail_counter,
-                "last_failure_time": getattr(cb, 'last_failure_time', None)
-            }
-            for name, cb in self.circuit_breakers.items()
-        }
+        breaker_status = {}
+        for name, cb in self.circuit_breakers.items():
+            if hasattr(cb, 'current_state'):
+                breaker_status[name] = {
+                    "state": str(cb.current_state),
+                    "failure_count": getattr(cb, 'fail_counter', 0),
+                    "last_failure_time": getattr(cb, 'last_failure_time', None)
+                }
+            else:
+                # Simple circuit breaker
+                breaker_status[name] = {
+                    "state": cb.state,
+                    "failure_count": cb.failure_count,
+                    "last_failure_time": cb.last_failure_time
+                }
 
         # Check clients
         client_status = {}
@@ -394,7 +544,7 @@ class Orchestrator:
 
         return {
             "overall_status": "healthy" if overall_healthy else "degraded",
-            "timestamp": asyncio.get_event_loop().time(),
+            "timestamp": time.time(),
             "components": {
                 "database": db_status,
                 "external_apis": api_status,
@@ -459,11 +609,19 @@ class Orchestrator:
             await self._session.close()
             
         # Cleanup local inference
-        if self.local_inference:
+        for client in self.clients.values():
+            if hasattr(client, 'cleanup'):
+                try:
+                    await client.cleanup()
+                except Exception as e:
+                    logger.warning(f"Error cleaning up client: {e}")
+
+        # Close cache
+        if self.semantic_cache and hasattr(self.semantic_cache, 'close'):
             try:
-                await self.local_inference.stop()
+                self.semantic_cache.close()
             except Exception as e:
-                logger.warning(f"Error stopping local inference: {e}")
+                logger.warning(f"Error closing cache: {e}")
 
         # Reset state
         self._initialized = False
@@ -478,5 +636,6 @@ class Orchestrator:
             "circuit_breakers": len(self.circuit_breakers),
             "cache_enabled": self.semantic_cache is not None,
             "router_enabled": self.router is not None,
-            "local_inference": self.local_inference is not None
+            "has_routellm": HAS_ROUTELLM,
+            "has_circuit_breaker": HAS_CIRCUIT_BREAKER
         }
